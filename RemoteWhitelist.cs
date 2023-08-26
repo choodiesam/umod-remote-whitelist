@@ -1,7 +1,9 @@
 ﻿using System.Collections.Generic;
+using UnityEngine.Playables;
 using Oxide.Core;
 using Oxide.Core.Libraries;
 using Newtonsoft.Json;
+using Oxide.Core.Libraries.Covalence;
 
 namespace Oxide.Plugins
 {
@@ -10,31 +12,21 @@ namespace Oxide.Plugins
     public class RemoteWhitelist : CovalencePlugin
     {
         private PluginConfig config;
+        private List whitelist;
+        private Timer updateTimer;
+
+        // Hooks
 
         private void Init()
         {
-            config = Config.ReadObject<PluginConfig>();
-
-            if (config.UpdateInterval < 10)
-            {
-                if (config.UpdateInterval != 0)
-                {
-                    Puts("Update interval cannot be less than 10 seconds!");
-                }
-                Puts("Remote updating is disabled.");
-            }
-            else
-            {
-                Puts($"Remote updating (every {config.UpdateInterval} seconds) is allowed.");
-                timer.Every(config.UpdateInterval, UpdateWhitelist);
-            }
+            updateTimer = timer.Once(1, () => { });
+            ReloadConfigFromFile();
+            ReloadWhitelist();
         }
 
         private bool CanUserLogin(string name, string id, string ip)
         {
-            List list = Interface.Oxide.DataFileSystem.ReadObject<List>(config.WhitelistFileName);
-
-            if (list == null || list.members == null || !list.members.Contains(id))
+            if (whitelist == null || whitelist.members == null || !whitelist.members.Contains(id))
             {
                 Puts($"Id {id} deny access with name {name} and ip {ip}");
                 return false;
@@ -43,24 +35,153 @@ namespace Oxide.Plugins
             return true;
         }
 
-        private void UpdateWhitelist()
+        void OnUserConnected(IPlayer player)
         {
-            webrequest.Enqueue(config.ApiUrl + config.ApiToken, null, (code, response) =>
+            NotifyMemberAction(new MemberAction
+            {
+                playerName = player.Name,
+                playerId = player.Id,
+                playerAddress = player.Address,
+                action = "connected"
+            });
+        }
+
+        void OnUserDisconnected(IPlayer player)
+        {
+            NotifyMemberAction(new MemberAction
+            {
+                playerName = player.Name,
+                playerId = player.Id,
+                playerAddress = player.Address,
+                action = "disconnected"
+            });
+        }
+
+        // Commands
+
+        [Command("RemoteWhitelist.whitelist")]
+        private void WhitelistCommand(IPlayer player, string command, string[] args)
+        {
+            if (args.Contains("reload"))
+            {
+                ReloadWhitelist();
+            }
+            else
+            {
+                Puts("Invalid arguments");
+            }
+        }
+
+        [Command("RemoteWhitelist.config")]
+        private void ConfCommand(IPlayer player, string command, string[] args)
+        {
+            if (args.Contains("reload"))
+            {
+                ReloadConfigFromFile();
+            }
+            else
+            {
+                Puts("Invalid arguments");
+            }
+        }
+
+        [Command("RemoteWhitelist.remoteUpdate")]
+        private void RemoteUpdateCommand(IPlayer player, string command, string[] args)
+        {
+            if (args.Contains("stop"))
+            {
+                StopRemoteUpdate();
+            }
+            else if (args.Contains("start"))
+            {
+                StartRemoteUpdate();
+            }
+            else
+            {
+                Puts("Invalid arguments");
+            }
+        }
+
+        // Custom stuff
+
+        private void NotifyMemberAction(MemberAction memberAction)
+        {
+            if (config.LogMemberActionEndpoint.Length != 0)
+            {
+                webrequest.Enqueue(
+                    config.LogMemberActionEndpoint,
+                    JsonConvert.SerializeObject(memberAction),
+                    (code, response) =>
+                    {
+                        if (code != 201)
+                        {
+                            Puts($"Get code {code} from {config.LogMemberActionEndpoint}");
+                        }
+                    },
+                    this, RequestMethod.POST,
+                    new Dictionary<string, string>{
+                    {"Content-Type", "application/json" }
+                    }
+                 );
+            }
+            Puts($"{memberAction.playerName} {memberAction.action}");
+        }
+
+        private void StartRemoteUpdate()
+        {
+            updateTimer.Destroy();
+
+            if (config.UpdateInterval < 5)
+            {
+                if (config.UpdateInterval != 0)
+                {
+                    Puts("Update interval cannot be less than 5 seconds!");
+                }
+                Puts("Remote update is disabled.");
+            }
+            else
+            {
+                Puts($"Remote update (every {config.UpdateInterval} seconds) is enabled.");
+                updateTimer = timer.Every(config.UpdateInterval, UpdateWhitelistFromRemote);
+            }
+        }
+
+        private void StopRemoteUpdate()
+        {
+            updateTimer.Destroy();
+            Puts("Remote update is disabled.");
+        }
+
+        private void SaveWhitelistToFile(List list)
+        {
+            Interface.Oxide.DataFileSystem.WriteObject(config.WhitelistFileName, list, true);
+            whitelist = list;
+        }
+
+        private void ReloadWhitelist()
+        {
+            whitelist = Interface.Oxide.DataFileSystem.ReadObject<List>(config.WhitelistFileName);
+        }
+
+        private void UpdateWhitelistFromRemote()
+        {
+            webrequest.Enqueue(config.WhitelistEndpoint, null, (code, response) =>
             {
                 if (code != 200)
                 {
-                    Puts($"Get code {code} from {config.ApiUrl + config.ApiToken}");
+                    Puts($"Get code {code} from {config.WhitelistEndpoint}");
                     return;
                 }
                 List list = JsonConvert.DeserializeObject<List>(response);
-                Interface.Oxide.DataFileSystem.WriteObject(config.WhitelistFileName, list, true);
-            }, this, RequestMethod.GET, new Dictionary<string, string> { }, config.ApiTimeout);
+                SaveWhitelistToFile(list);
+            }, this, RequestMethod.GET, new Dictionary<string, string> { });
         }
 
-        private class List
+        private void ReloadConfigFromFile()
         {
-            public string[] members;
-            public string createdAt;
+            config = Config.ReadObject<PluginConfig>();
+            Puts("Config reloaded from file");
+            StartRemoteUpdate();
         }
 
         protected override void LoadDefaultConfig()
@@ -72,19 +193,31 @@ namespace Oxide.Plugins
         {
             return new PluginConfig
             {
-                ApiUrl = "https://rust.choodiesam.com/api/rust-plugin/whitelist/",
-                ApiTimeout = 2,
-                ApiToken = "token",
+                WhitelistEndpoint = "https://remote-whitelist.choodiesam.com/api/whitelist/plugin/token",
+                LogMemberActionEndpoint = "https://remote-whitelist.choodiesam.com/api/whitelist/plugin/token/member-action",
                 UpdateInterval = 60,
                 WhitelistFileName = "WhitelistSteamIds",
             };
         }
 
+        private class MemberAction
+        {
+            public string playerName;
+            public string playerId;
+            public string playerAddress;
+            public string action;
+        }
+
+        private class List
+        {
+            public string[] members;
+            public string createdAt;
+        }
+
         private class PluginConfig
         {
-            public string ApiUrl;
-            public float ApiTimeout;
-            public string ApiToken;
+            public string WhitelistEndpoint;
+            public string LogMemberActionEndpoint;
             public float UpdateInterval;
             public string WhitelistFileName;
         }
